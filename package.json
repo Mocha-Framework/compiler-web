@@ -1,0 +1,45 @@
+{
+  "name": "@mocha/compiler-web",
+  "version": "0.1.0",
+  "description": "Mocha Compiler Web - Compile .qml.ts to Angular components with platform directives",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./codegen": {
+      "types": "./dist/codegen-entry.d.ts",
+      "import": "./dist/codegen-entry.js",
+      "default": "./dist/codegen-entry.js"
+    },
+    "./vite-plugin": {
+      "types": "./dist/vite-plugin.d.ts",
+      "import": "./dist/vite-plugin.js",
+      "default": "./dist/vite-plugin.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "import": "./dist/cli.js",
+      "default": "./dist/cli.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mocha/core": "workspace:*",
+    "@mocha/qml": "workspace:*",
+    "esbuild": "^0.25.0"
+  },
+  "peerDependencies": {
+    "@angular/core": "^20.0.0"
+  },
+  "devDependencies": {
+    "vite": "^8.1.5"
+  }
+}
