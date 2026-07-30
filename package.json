@@ -33,7 +33,6 @@
   },
   "dependencies": {
     "@mocha/core": "^0.1.0",
-    "@mocha/qml": "^0.1.0",
     "esbuild": "^0.25.0"
   },
   "peerDependencies": {

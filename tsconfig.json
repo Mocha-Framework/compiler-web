@@ -5,8 +5,7 @@
     "rootDir": "src"
   },
   "references": [
-    { "path": "../core" },
-    { "path": "../qml" }
+    { "path": "../core" }
   ],
   "include": ["src"]
 }

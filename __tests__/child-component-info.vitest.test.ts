@@ -15,7 +15,7 @@ import {
 
 const sampleChildSource = `
 import { QObject, input, output, model, QProperty } from "@mocha/core";
-import { QMLComponent, qml } from "@mocha/qml";
+import { QMLComponent, qml } from "@mocha/core/qml";
 
 @QMLComponent({
   qml: qml\`
