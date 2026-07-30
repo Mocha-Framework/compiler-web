@@ -1,6 +1,6 @@
 {
   "name": "@mocha/compiler-web",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Mocha Compiler Web - Compile .qml.ts to Angular components with platform directives",
   "type": "module",
   "main": "./dist/index.js",
