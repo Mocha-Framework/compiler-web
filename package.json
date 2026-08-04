@@ -1,6 +1,6 @@
 {
-  "name": "@mocha/compiler-web",
-  "version": "0.2.0",
+  "name": "@mocha-framework/compiler-web",
+  "version": "0.2.1-alpha.0",
   "description": "Mocha Compiler Web - Compile .qml.ts to Angular components with platform directives",
   "type": "module",
   "main": "./dist/index.js",
@@ -11,6 +11,11 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "import": "./dist/browser.js",
+      "default": "./dist/browser.js"
+    },
     "./codegen": {
       "types": "./dist/codegen-entry.d.ts",
       "import": "./dist/codegen-entry.js",
@@ -20,6 +25,11 @@
       "types": "./dist/vite-plugin.d.ts",
       "import": "./dist/vite-plugin.js",
       "default": "./dist/vite-plugin.js"
+    },
+    "./controller-codegen": {
+      "types": "./dist/controller-codegen.d.ts",
+      "import": "./dist/controller-codegen.js",
+      "default": "./dist/controller-codegen.js"
     },
     "./cli": {
       "types": "./dist/cli.d.ts",
@@ -32,13 +42,22 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@mocha/core": "^0.1.0",
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.25.0",
+    "@mocha-framework/core": "*"
   },
   "peerDependencies": {
     "@angular/core": "^20.0.0"
   },
   "devDependencies": {
     "vite": "^8.1.5"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mocha-Framework/compiler-web.git"
+  },
+  "keywords": [],
+  "bugs": {
+    "url": "https://github.com/Mocha-Framework/compiler-web/issues"
+  },
+  "homepage": "https://github.com/Mocha-Framework/compiler-web#readme"
 }

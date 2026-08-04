@@ -11,11 +11,11 @@ import {
   extractChildControllerInfo,
   buildChildRegistry,
   type ChildControllerInfo,
-} from "@mocha/compiler-web";
+} from "@mocha-framework/compiler-web";
 
 const sampleChildSource = `
-import { QObject, input, output, model, QProperty } from "@mocha/core";
-import { QMLComponent, qml } from "@mocha/core/qml";
+import { QObject, input, output, model, QProperty } from "@mocha-framework/core";
+import { QMLComponent, qml } from "@mocha-framework/core/qml";
 
 @QMLComponent({
   qml: qml\`

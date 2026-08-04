@@ -1,4 +1,4 @@
-import type { Plugin, ResolvedConfig } from 'vite';
+import type { ResolvedConfig } from 'vite';
 import { compileQmlToAngular } from './qml-to-angular.js';
 import type { Platform, CompiledComponent } from './qml-to-angular.js';
 
@@ -16,22 +16,22 @@ export interface MochaAngularPluginOptions {
  * The output is compiled to JS via esbuild (lazy-imported) so Rollup can
  * parse it during vite build.
  */
-export function mochaAngularPlugin(options: MochaAngularPluginOptions = {}): Plugin {
+export function mochaAngularPlugin(options: MochaAngularPluginOptions = {}): any {
   const target: Platform = options.target ?? 'web';
   const selectorPrefix = options.selectorPrefix ?? 'app';
 
   return {
-    name: '@mocha/compiler-web',
+    name: '@mocha-framework/compiler-web',
     enforce: 'post',
 
     configResolved(config: ResolvedConfig) {
-      console.log(`[@mocha/compiler-web] Plugin active, target=${target}`);
+      console.log(`[@mocha-framework/compiler-web] Plugin active, target=${target}`);
     },
 
     async transform(code: string, id: string) {
       if (!id.endsWith('.qml.ts')) return null;
 
-      console.log(`[@mocha/compiler-web] Transforming ${id}`);
+      console.log(`[@mocha-framework/compiler-web] Transforming ${id}`);
 
       try {
         // Dynamic imports keep Node.js deps out of the Rollup bundle
@@ -50,8 +50,8 @@ export function mochaAngularPlugin(options: MochaAngularPluginOptions = {}): Plu
 
         return { code: compiled.code, map: null };
       } catch (e: any) {
-        console.error(`[@mocha/compiler-web] Error transforming ${id}:`, e);
-        return { code: `// [@mocha/compiler-web] Error: ${e.message}`, map: null };
+        console.error(`[@mocha-framework/compiler-web] Error transforming ${id}:`, e);
+        return { code: `// [@mocha-framework/compiler-web] Error: ${e.message}`, map: null };
       }
     },
   };
@@ -260,7 +260,7 @@ function extractControllerSource(source: string, className: string): string {
 
 function extractQPropertyNames(source: string): string[] {
   const names: string[] = [];
-  const re = /@qproperty\s+(\w+)/g;
+  const re = /@(?:qproperty|qcomputed)\s+(\w+)/g;
   let m;
   while ((m = re.exec(source)) !== null) names.push(m[1]);
   return names;

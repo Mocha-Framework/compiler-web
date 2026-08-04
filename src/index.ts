@@ -34,6 +34,6 @@ export type { ChildControllerInfo } from './child-component-info.js';
 
 // Codegen and node-only tooling live in their own entry so the browser bundle
 // doesn't pull in node:fs / node:path / node:crypto transitively via
-// @mocha/compiler-web.
-// transformQmlTs is exported from @mocha/compiler-web/vite-plugin
-// generateWebProject / cleanWebProject are exported from @mocha/compiler-web/codegen
+// @mocha-framework/compiler-web.
+// transformQmlTs is exported from @mocha-framework/compiler-web/vite-plugin
+// generateWebProject / cleanWebProject are exported from @mocha-framework/compiler-web/codegen

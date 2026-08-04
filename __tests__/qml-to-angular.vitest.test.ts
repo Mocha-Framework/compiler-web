@@ -1,5 +1,5 @@
 import { describe, test, expect } from "vitest";
-import { compileQmlToAngular } from "@mocha/compiler-web";
+import { compileQmlToAngular } from "@mocha-framework/compiler-web";
 
 function compile(qml: string) {
   return compileQmlToAngular(qml, {

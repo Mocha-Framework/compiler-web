@@ -1,7 +1,7 @@
 /**
  * QML → Angular Element Mapper
  *
- * Maps QML elements to Angular components using @mocha/qml-ng registry.
+ * Maps QML elements to Angular components using @mocha-framework/qml-ng registry.
  * Stays pure (no fs/path imports) for compatibility with Vite bundling.
  */
 
@@ -14,7 +14,7 @@ export interface AngularElementDef {
   importName?: string;
 }
 
-// Auto-generated from @mocha/qml-ng registry component-map.json.
+// Auto-generated from @mocha-framework/qml-ng registry component-map.json.
 // Contains all public MochaDS QML components mapped to their qml-ng selectors.
 const QML_NG_MAP: Record<string, string> = {
   Accordion: 'Accordion', AdaptiveStack: 'AdaptiveStack',
@@ -86,7 +86,7 @@ export function getElementDef(tag: string): AngularElementDef | undefined {
   if (qmlNgSelector) {
     return {
       tag: qmlNgSelector,
-      importPath: '@mocha/qml-ng',
+      importPath: '@mocha-framework/qml-ng',
       importName: tag,
     };
   }
@@ -98,7 +98,7 @@ export function getElementDef(tag: string): AngularElementDef | undefined {
 export function hasQmlNgComponent(tag: string): boolean {
   // Check fallback for qml-ng mapped items
   const fb = FALLBACK_MAP[tag];
-  if (fb?.importPath === '@mocha/qml-ng') return true;
+  if (fb?.importPath === '@mocha-framework/qml-ng') return true;
   // Check main qml-ng map
   return tag in QML_NG_MAP;
 }

@@ -38,6 +38,30 @@ export interface CodegenOptions {
   prefix?: string;
   /** Verbose logging. */
   verbose?: boolean;
+  /**
+   * When true, emit a complete web app scaffold in `outDir`:
+   *   - `index.html` with the root component selector
+   *   - `main.ts` with `bootstrapApplication` + `provideZonelessChangeDetection`
+   *   - `global-state.ts` (if any `@Injectable` services were detected)
+   *   - `package.json` with `"type": "module"`
+   */
+  webBootstrap?: boolean;
+  /**
+   * The root component selector (e.g. `app-app-controller`). Used by the
+   * generated `index.html` host element. Defaults to finding the App.*.qml.ts
+   * file and computing its selector.
+   */
+  rootSelector?: string;
+  /**
+   * The root component class name (e.g. `AppControllerComponent`). Used by
+   * the generated `main.ts` to bootstrap the application.
+   */
+  rootClassName?: string;
+  /**
+   * Path to the generated `qml-routes.ts` (relative to outDir). Defaults to
+   * `./qml-routes`. Used by `main.ts` to wire `provideRouter`.
+   */
+  routesImport?: string;
 }
 
 export interface GeneratedRoute {
@@ -62,6 +86,7 @@ export async function generateWebProject(
   const outDir = resolve(process.cwd(), opts.outDir);
   const prefix = opts.prefix ?? DEFAULT_PREFIX;
   const verbose = !!opts.verbose;
+  const webBootstrap = opts.webBootstrap ?? true;
 
   if (!(await safeStat(srcDir))) {
     return { filesWritten: [], routes: [], warnings: [], skipped: [] };
@@ -77,10 +102,31 @@ export async function generateWebProject(
     skipped: [],
   };
 
+  // Track injectables (services like GlobalState) for web-bootstrap generation
+  const injectables: Array<{ className: string; fileName: string; controllerSource: string }> = [];
+
   for (const absSrc of sources) {
     const source = await readFile(absSrc, "utf-8");
     const hash = sha256(source);
     const cachePath = `${absSrc}.mochacache`;
+
+    // Detect @Injectable classes for service scaffolding
+    const injectableMatch = source.match(/@Injectable[\s\S]*?export\s+class\s+(\w+)/);
+    if (injectableMatch) {
+      const className = injectableMatch[1];
+      // Generate the service file (kebab-cased name, .ts extension)
+      const baseName = relative(srcDir, absSrc).replace(/\.qml\.ts$/, "").replace(/\.ts$/, "");
+      const lastSegment = baseName.split(/[\\/]/).pop()!;
+      const serviceFileName = lastSegment
+        .replace(/([A-Z])/g, '-$1')
+        .toLowerCase()
+        .replace(/^-/, '') + '.ts';
+      injectables.push({
+        className,
+        fileName: serviceFileName,
+        controllerSource: source,
+      });
+    }
 
     const cached = await readCache(cachePath);
     if (cached && cached.hash === hash) {
@@ -97,6 +143,11 @@ export async function generateWebProject(
 
     let compiled: CompiledComponent;
     try {
+      // Skip plain .ts files that don't have a qml template — they're services
+      if (!absSrc.endsWith(".qml.ts")) {
+        // Services are handled separately in the bootstrap pass
+        continue;
+      }
       compiled = transformQmlTs(source, "web", prefix);
     } catch (e: any) {
       result.warnings.push(
@@ -131,7 +182,8 @@ export async function generateWebProject(
         const qmlSource = r.componentSource;
         const noExt = qmlSource.replace(/\.qml$/, "").replace(/^\.\//, "");
         const segments = noExt.split(/[\\/]/).filter(Boolean);
-        const targetPascal = segments.pop()!;
+        const targetPascal = segments.pop();
+        if (!targetPascal) continue;
         const dirSegments = segments; // e.g. ['views']
         const rel =
           (dirSegments.length ? dirSegments.join("/") + "/" : "") +
@@ -179,7 +231,189 @@ export async function generateWebProject(
   await writeFile(routesFile, routesCode, "utf-8");
   result.filesWritten.push(routesFile);
 
+  // Generate service files for each @Injectable (always, not just webBootstrap)
+  const serviceImports: string[] = [];
+  for (const inj of injectables) {
+    const serviceTs = await generateServiceFile(inj);
+    const servicePath = join(outDir, inj.fileName);
+    await writeFile(servicePath, serviceTs, "utf-8");
+    result.filesWritten.push(servicePath);
+    const importPath = "./" + inj.fileName.replace(/\.ts$/, "");
+    serviceImports.push(`import { ${inj.className} } from '${importPath}';`);
+  }
+
+  // Web bootstrap: generate index.html, main.ts, and services.
+  if (webBootstrap) {
+    const rootSelector = opts.rootSelector ?? inferRootSelector(sources, prefix);
+    const rootClassName = opts.rootClassName ?? inferRootClassName(sources);
+    const routesImport = opts.routesImport ?? "./qml-routes";
+
+    // Write a minimal Vite config that tells Vite to handle TypeScript with legacy decorators
+    const viteConfig = 'import { defineConfig } from \'vite\';\n' +
+      'export default defineConfig({\n' +
+      '  resolve: {\n' +
+      '    extensions: [\'.ts\', \'.mjs\', \'.js\'],\n' +
+      '  },\n' +
+      '  esbuild: {\n' +
+      '    target: \'es2022\',\n' +
+      '    tsconfigRaw: JSON.stringify({\n' +
+      '      compilerOptions: {\n' +
+      '        experimentalDecorators: true,\n' +
+      '        useDefineForClassFields: false,\n' +
+      '      },\n' +
+      '    }),\n' +
+      '  },\n' +
+      '});\n';
+    await writeFile(join(outDir, "vite.config.ts"), viteConfig, "utf-8");
+    result.filesWritten.push(join(outDir, "vite.config.ts"));
+
+    const mainTs = generateMainTs({
+      rootClassName,
+      routesImport,
+      serviceImports,
+      hasRoutes: result.routes.length > 0,
+    });
+    await writeFile(join(outDir, "main.ts"), mainTs, "utf-8");
+    result.filesWritten.push(join(outDir, "main.ts"));
+
+    // package.json (minimal, for ESM)
+    const packageJson = JSON.stringify({ type: "module" }, null, 2) + "\n";
+    await writeFile(join(outDir, "package.json"), packageJson, "utf-8");
+    result.filesWritten.push(join(outDir, "package.json"));
+  }
+
+  // After writing all .ts files, the Angular CLI handles AOT compilation.
+  // No need for esbuild post-compilation — ng serve / ng build do that.
+
   return result;
+}
+
+/**
+ * Infer the root component selector from the first App*.qml.ts file in the
+ * source tree, applying the standard kebab-case convention.
+ */
+function inferRootSelector(sources: string[], prefix: string): string {
+  // Find first file that contains a class declaration starting with "App"
+  for (const absSrc of sources) {
+    const fileName = basename(absSrc, ".qml.ts");
+    if (fileName === "App" || fileName.startsWith("App")) {
+      const className = fileName + "Controller";
+      return `${prefix}-${className
+        .replace(/([A-Z])/g, '-$1')
+        .toLowerCase()
+        .replace(/^-/, '')}`;
+    }
+  }
+  // Fallback
+  return `${prefix}-root`;
+}
+
+function inferRootClassName(sources: string[]): string {
+  for (const absSrc of sources) {
+    const fileName = basename(absSrc, ".qml.ts");
+    if (fileName === "App" || fileName.startsWith("App")) {
+      return fileName + "ControllerComponent";
+    }
+  }
+  return "AppComponent";
+}
+
+function generateIndexHtml(rootSelector: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mocha App</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, sans-serif; }
+  </style>
+</head>
+<body>
+  <${rootSelector}></${rootSelector}>
+  <script type="module" src="/main.ts"></script>
+</body>
+</html>
+`;
+}
+
+interface MainTsOptions {
+  rootClassName: string;
+  routesImport: string;
+  serviceImports: string[];
+  hasRoutes: boolean;
+}
+
+function generateMainTs(opts: MainTsOptions): string {
+  const imports = [
+    `import '@angular/compiler';`,
+    `import { bootstrapApplication } from '@angular/platform-browser';`,
+    `import { provideZonelessChangeDetection } from '@angular/core';`,
+    `import { ${opts.rootClassName} } from './app.component';`,
+    ...opts.serviceImports,
+  ];
+  if (opts.hasRoutes) {
+    imports.push(`import { provideRouter } from '@angular/router';`);
+    imports.push(`import { QML_ROUTES } from '${opts.routesImport}';`);
+  }
+  return `${imports.join('\n')}
+
+bootstrapApplication(${opts.rootClassName}, {
+  providers: [
+    provideZonelessChangeDetection(),${opts.hasRoutes ? '\n    provideRouter(QML_ROUTES),' : ''}
+  ],
+}).catch((err) => console.error(err));
+`;
+}
+
+async function generateServiceFile(inj: {
+  className: string;
+  fileName: string;
+  controllerSource: string;
+}): Promise<string> {
+  // Use the same transform as a regular controller but emit as a service
+  // (no @Component wrapper, no template). The class is exported directly.
+  const { transformControllerClass } = await import("./controller-codegen.js");
+  const transform = transformControllerClass(inj.controllerSource, inj.className);
+  if (!transform) {
+    return `// Error transforming ${inj.className}\nexport class ${inj.className} {}\n`;
+  }
+
+  // Emit the class with @Injectable decorator and providerIn: 'root'
+  const bodyLines = transform.bodyLines.map((l) => {
+    // Remove the @Injectable() decorator line that transformControllerClass
+    // may have included (we add our own below)
+    if (l.includes('@Injectable')) return '';
+    return l;
+  }).filter(Boolean);
+
+  // Determine Angular symbols needed (signal, computed, inject, etc.)
+  const bodyText = bodyLines.join('\n');
+  const needsInjectable = !/import\s*\{[^}]*Injectable[^}]*\}\s*from\s*['"]@angular\/core['"]/.test(bodyText);
+  const usesSignal = /\bsignal\(/.test(bodyText);
+  const usesComputed = /\bcomputed\(/.test(bodyText);
+  const usesInject = /\binject\(/.test(bodyText);
+
+  const symbols = new Set<string>();
+  if (needsInjectable) symbols.add('Injectable');
+  if (usesSignal) symbols.add('signal');
+  if (usesComputed) symbols.add('computed');
+  if (usesInject) symbols.add('inject');
+
+  const lines: string[] = [];
+  if (symbols.size > 0) {
+    lines.push(`import { ${[...symbols].sort().join(', ')} } from '@angular/core';`);
+  }
+  lines.push('');
+  lines.push(`@Injectable({ providedIn: 'root' })`);
+  lines.push(`export class ${inj.className} {`);
+  for (const l of bodyLines) {
+    lines.push(l);
+  }
+  lines.push('}');
+  lines.push('');
+  return lines.join('\n');
 }
 
 /** Remove the codegen output. Useful in cleanup hooks. */
@@ -225,6 +459,12 @@ async function collectQmlTs(dir: string): Promise<string[]> {
         await walk(p);
       } else if (s.isFile()) {
         if (entry.endsWith(".qml.ts")) out.push(p);
+        else if (entry.endsWith(".ts") && !entry.endsWith(".d.ts")) {
+          // Also collect plain .ts files to find @Injectable services.
+          // We only use these for service scaffolding, not for component
+          // generation.
+          out.push(p);
+        }
       }
     }
   }
@@ -322,7 +562,6 @@ function generateRoutesModule(routes: GeneratedRoute[]): string {
   const seen = new Set<string>();
 
   for (const r of routes) {
-    // loadFrom is e.g. "./views/home.component.js" — turn into "./views/home.component"
     const importPath = r.loadFrom.replace(/\.js$/, "");
     if (!seen.has(importPath)) {
       imports.push(`import { ${r.componentClass} } from '${importPath}';`);
@@ -330,21 +569,27 @@ function generateRoutesModule(routes: GeneratedRoute[]): string {
     }
   }
 
+  if (routes.length === 0) {
+    return [
+      `import { Routes } from '@angular/router';`,
+      ``,
+      `export const routes: Routes = [];`,
+      ``,
+    ].join("\n");
+  }
+
   const entries = routes
     .map((r) => {
-      // loadFrom here without .js — Vite/Rollup will resolve either way,
-      // but the embedded template literal in qml-routes.ts is consumed by
-      // ts/esbuild, so we keep the .js extension explicit at runtime.
-      return `  { path: '${r.path}', loadComponent: () => import('${r.loadFrom}').then(m => m.${r.componentClass}) }`;
+      const loadPath = r.loadFrom.replace(/\.js$/, "");
+      return `  { path: '${r.path}', loadComponent: () => import('${loadPath}').then(m => m.${r.componentClass}) }`;
     })
     .join(",\n");
 
   return [
-    `/* AUTO-GENERATED. Do not edit. */`,
-    `import type { Routes } from '@angular/router';`,
+    `import { Routes } from '@angular/router';`,
     ...imports,
     ``,
-    `export const QML_ROUTES: Routes = [\n${entries}\n];`,
+    `export const routes: Routes = [\n${entries}\n];`,
     ``,
   ].join("\n");
 }

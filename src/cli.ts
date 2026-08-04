@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AOT CLI for @mocha/compiler-web.
+ * AOT CLI for @mocha-framework/compiler-web.
  *
  * Scan .qml.ts files in a project and generate Angular component files.
  *
@@ -31,7 +31,7 @@ export async function runCli(options: CliOptions): Promise<void> {
   const prefix = options.selectorPrefix ?? 'app';
 
   if (!existsSync(srcPath)) {
-    console.error(`[@mocha/compiler-web] Source not found: ${srcPath}`);
+    console.error(`[@mocha-framework/compiler-web] Source not found: ${srcPath}`);
     process.exit(1);
   }
 
@@ -52,7 +52,7 @@ export async function runCli(options: CliOptions): Promise<void> {
     writeFileSync(outTs, result.componentTs, 'utf-8');
     writeFileSync(outHtml, result.template, 'utf-8');
 
-    console.log(`[@mocha/compiler-web] Generated:`);
+    console.log(`[@mocha-framework/compiler-web] Generated:`);
     console.log(`  ${outTs}`);
     console.log(`  ${outHtml}`);
 
@@ -63,7 +63,7 @@ export async function runCli(options: CliOptions): Promise<void> {
       }
     }
   } catch (e: any) {
-    console.error(`[@mocha/compiler-web] Compilation failed:`, e.message);
+    console.error(`[@mocha-framework/compiler-web] Compilation failed:`, e.message);
     process.exit(1);
   }
 }

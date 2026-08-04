@@ -1,4 +1,4 @@
-import type { QmlElement } from "@mocha/core/qml";
+import type { QmlElement } from "@mocha-framework/core/qml";
 import type { ChildControllerInfo } from "./child-component-info.js";
 import { tagToSelector } from "./child-component-info.js";
 

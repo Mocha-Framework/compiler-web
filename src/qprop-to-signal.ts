@@ -1,12 +1,12 @@
 import { Signal, signal } from '@angular/core';
-import { QProperty } from '@mocha/core';
+import { QProperty } from '@mocha-framework/core';
 
 function filter<T>(qprop: QProperty<T>, fn: (v: T) => void): () => void {
   return qprop.onValue(fn);
 }
 
 /**
- * Converts a `@mocha/core` `QProperty<T>` to an Angular `Signal<T>`.
+ * Converts a `@mocha-framework/core` `QProperty<T>` to an Angular `Signal<T>`.
  *
  * The returned signal stays in sync with the QProperty:
  *   - When the QProperty changes → the Angular signal updates

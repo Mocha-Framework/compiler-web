@@ -1,10 +1,11 @@
-import { QmlAstParser } from '@mocha/qml/ast';
-import type { QmlElement, QmlDocument } from '@mocha/qml/ast';
+import { QmlAstParser } from '@mocha-framework/core/qml';
+import type { QmlElement, QmlDocument } from '@mocha-framework/core/qml';
 import { preprocessPlatformDirectives } from './platform-directives.js';
 import type { Platform, HtmlBlock } from './platform-directives.js';
 import { getElementDef, hasQmlNgComponent } from './element-mapper.js';
 import { walkChildComponent, type ChildBindingsContext } from './child-component-codegen.js';
 import type { ChildControllerInfo } from './child-component-info.js';
+import { transformControllerClass } from './controller-codegen.js';
 
 export type { Platform, HtmlBlock };
 
@@ -83,6 +84,7 @@ export function compileQmlToAngular(
     childRegistry: options.childRegistry ?? new Map(),
     childImports: new Set<string>(),
     childSelectorPrefix: options.childSelectorPrefix ?? 'app',
+    qpropertyNames: new Set(options.qpropertyNames ?? []),
   };
 
   const elementsToWalk =
@@ -130,10 +132,90 @@ interface WalkCtx {
   childRegistry: Map<string, ChildControllerInfo>;
   childImports: Set<string>;
   childSelectorPrefix: string;
+  /** Names of controller fields decorated with `@qproperty` — only these become
+   *  signal calls (`controller.X` → `X()`). Other fields stay as plain property access. */
+  qpropertyNames: Set<string>;
 }
 
 function isWindow(el: QmlElement): boolean {
   return el.tag === 'ApplicationWindow' || el.tag === 'Window';
+}
+
+/**
+ * In the new Angular-pure model, every property on the controller class IS
+ * a signal. So `controller.X` and `this.X` both become bare `X` (which the
+ * template calls as `X()` to read). The class IS the component, so there's
+ * no `ctrl.X` indirection.
+ *
+ * - `controller.X.value`     → `X()`
+ * - `controller.X`           → `X`
+ * - `this.X.value`           → `X()`
+ * - `this.X`                 → `X`
+ * - `controller.X.value.foo` → `X().foo` (chained access on signal value)
+ */
+function translateControllerRef(value: string): string {
+  // Walk character-by-character so we don't break on strings or nested braces.
+  let out = '';
+  let i = 0;
+  let depth = 0;
+  let inStr: '"' | "'" | null = null;
+
+  while (i < value.length) {
+    const ch = value[i];
+
+    if (inStr) {
+      out += ch;
+      if (ch === '\\' && i + 1 < value.length) {
+        out += value[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === inStr) inStr = null;
+      i++;
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      inStr = ch as '"' | "'";
+      out += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === '(' || ch === '{' || ch === '[') {
+      depth++;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === ')' || ch === '}' || ch === ']') {
+      depth--;
+      out += ch;
+      i++;
+      continue;
+    }
+
+    // Match `controller.X.value` or `this.X.value` followed by `.`, `=`, `+`, `-`, etc.
+    const ctrlVal = value.slice(i).match(/^(?:controller|this)\.(\w+)\.value\b/);
+    if (ctrlVal) {
+      out += `${ctrlVal[1]}()`;
+      i += ctrlVal[0].length;
+      continue;
+    }
+
+    // Match `(controller|this).X` (any remaining — strip prefix)
+    const ctrl = value.slice(i).match(/^(?:controller|this)\.(\w+)/);
+    if (ctrl) {
+      out += ctrl[1];
+      i += ctrl[0].length;
+      continue;
+    }
+
+    out += ch;
+    i++;
+  }
+
+  return out;
 }
 
 function walkElement(el: QmlElement, indent: number, ctx: WalkCtx): string {
@@ -223,7 +305,7 @@ function walkElement(el: QmlElement, indent: number, ctx: WalkCtx): string {
       // `def.tag` (the resolved selector) for the HTML tag, while keeping
       // `el.tag` (the class name) as the import binding.
       const tag = def.tag;
-      const attrs = formatAttrsSimple(el, '');
+      const attrs = formatAttrsSimple(el, '', ctx.qpropertyNames);
       const childrenHtml = walkChildren(el, indent + 1, ctx);
       if (!childrenHtml) return pad + `<${tag}${attrs}></${tag}>`;
       return pad + `<${tag}${attrs}>\n${childrenHtml}\n${pad}</${tag}>`;
@@ -236,7 +318,7 @@ function walkElement(el: QmlElement, indent: number, ctx: WalkCtx): string {
   const childrenHtml = walkChildren(el, indent + 1, ctx);
 
   if (def && !qmlNgTag) {
-    const attrs = formatAttrsFallback(props, el);
+    const attrs = formatAttrsFallback(el, '', ctx.qpropertyNames);
     const tag = def.tag;
     const content = childrenHtml || extractStaticText(el.body);
     if (!content) return pad + `<${tag}${attrs}></${tag}>`;
@@ -245,7 +327,7 @@ function walkElement(el: QmlElement, indent: number, ctx: WalkCtx): string {
   }
 
   ctx.warnings.push(`Unknown QML element: ${el.tag}, rendered as <div>`);
-  const attrs = formatAttrsFallback(props, el);
+  const attrs = formatAttrsFallback(el, '', ctx.qpropertyNames);
   const content = childrenHtml || extractStaticText(el.body);
   if (!content) return pad + `<div${attrs}></div>`;
   if (!childrenHtml) return pad + `<div${attrs}>${content}</div>`;
@@ -263,53 +345,76 @@ function walkChildren(el: QmlElement, indent: number, ctx: WalkCtx): string {
 
 // ── Simplified pass-through formatting for qml-ng components ──
 
-function formatAttrsSimple(el: QmlElement, _baseClass: string): string {
-  const props = parseQmlProps(el.body);
-  if (props.length === 0) return '';
+function formatAttrsSimple(el: QmlElement, _baseClass: string, qpropertyNames: Set<string>): string {
   const parts: string[] = [];
-  for (const [key, value, wasQuoted] of props) {
+  for (const [rawKey, rawValue] of Object.entries(el.attrs)) {
     // Filter out QML-internal props not relevant to Angular
-    if (key.startsWith('anchors.') || key === 'id' || key === 'x' || key === 'y' || key === 'z' || key === 'width' || key === 'height') continue;
-    if (key === 'visible' || key === 'enabled' || key === 'clip' || key === 'opacity') continue;
+    if (rawKey.startsWith('anchors.') || rawKey === 'id' || rawKey === 'x' || rawKey === 'y' || rawKey === 'z' || rawKey === 'width' || rawKey === 'height') continue;
+    if (rawKey === 'visible' || rawKey === 'enabled' || rawKey === 'clip' || rawKey === 'opacity') continue;
+    // Skip font.* boolean attributes (qml-ng handles these via CSS)
+    // Keep font.pixelSize, font.pointSize, font.family as they map to qml-ng inputs
+    if (rawKey === 'font.bold' || rawKey === 'font.italic' || rawKey === 'font.underline' || rawKey === 'font.weight') continue;
+
+    // Detect whether the rawValue is a *pure* string literal (just `"..."` or
+    // `'...'`) versus a JS-like expression that happens to start/end with
+    // a quote (e.g. `"Count: " + count()`). We treat it as a literal only
+    // when the inner content has no other quote characters.
+    let value = rawValue;
+    let wasQuoted = false;
+    let wasBlock = false;
+    const outerQuote = (value.startsWith('"') || value.startsWith("'")) ? value[0] : null;
+    if (outerQuote && value[value.length - 1] === outerQuote && value.length >= 2) {
+      const inner = value.slice(1, -1);
+      if (!inner.includes('"') && !inner.includes("'")) {
+        wasQuoted = true;
+        value = inner;
+      }
+    } else if (value.startsWith('{') && value.endsWith('}')) {
+      wasBlock = true;
+      value = value.slice(1, -1).trim();
+    }
 
     // Convert QML dotted properties to camelCase (font.pixelSize → fontPixelSize)
-    const mappedKey = key.replace(/\.([a-zA-Z])/g, (_, c) => c.toUpperCase());
+    const mappedKey = rawKey.replace(/\.([a-zA-Z])/g, (_, c) => c.toUpperCase());
 
-    const binding = mapBindingSimple(mappedKey, value, wasQuoted);
+    const binding = mapBindingSimple(mappedKey, value, wasQuoted, qpropertyNames, wasBlock);
     if (binding) parts.push(binding);
   }
   return parts.length > 0 ? ' ' + parts.join(' ') : '';
 }
 
-function mapBindingSimple(key: string, value: string, wasQuoted: boolean = false): string | null {
-  // Translate controller.X.value → X() anywhere in the expression
-  const translatedValue = value.replace(/controller\.(\w+)\.value/g, '$1()');
-  // Also translate trailing controller.X → X() (when not followed by .)
-  const fullyTranslated = translatedValue.replace(/controller\.(\w+)(?!\.)/g, '$1()');
+function mapBindingSimple(key: string, value: string, wasQuoted: boolean, qpropertyNames: Set<string>, wasBlock: boolean = false): string | null {
+  // Translate controller.X → X() ONLY for QProperty signals
+  const translatedValue = translateControllerRef(value);
 
-  // Event handlers: QML onClicked → Angular (clicked)
+// Event handlers: QML onClicked → Angular (click)
   if (key.startsWith('on') && /^on[A-Z]/.test(key)) {
-    const eventName = key.slice(2);
-    const lc = eventName.charAt(0).toLowerCase() + eventName.slice(1);
-    const fn = fullyTranslated.match(/^(\w+)\(/);
-    if (fn) return `(${lc})="ctrl.${fn[1]}($event)"`;
-    const svc = value.match(/^(\w+)\.(\w+)\(/);
-    if (svc) return `(${lc})="ctrl.callRoot('${svc[1]}', '${svc[2]}')"`;
-    return `(${lc})="${fullyTranslated}"`;
+    const event = mapEvent(key);
+    let body = translatedValue;
+    if (wasBlock) body = body.replace(/^\{|\}$/g, '').trim();
+    // The body is the actual method body. In the Angular-pure model the
+    // class IS the component, so the method is called directly (no
+    // `ctrl.` indirection). The `chain` regex matches `global().increment(...)`
+    // → `global().increment($event)` and `increment()` → `increment($event)`.
+    const chain = body.match(/^(\w+(?:\(\))?)\.(\w+)\(/);
+    if (chain) return `${event}="${chain[1]}.${chain[2]}($event)"`;
+    const fn = body.match(/^(\w+)\(/);
+    if (fn) return `${event}="${fn[1]}($event)"`;
+    return `${event}='${body.replace(/'/g, "\\'")}'`;
   }
 
-  // Controller binding: controller.prop[.value] → [prop]="prop()"
+  // Controller binding (single property access)
   if (value.startsWith('controller.')) {
     const m = value.match(/^controller\.(\w+)(?:\.value)?$/);
-    if (m) return `[${key}]="${m[1]}()"`;
-    return `[${key}]="${fullyTranslated}"`;
+    if (m && qpropertyNames.has(m[1])) return `[${key}]="${m[1]}()"`;
+    if (m) return `[${key}]="${m[1]}"`;
+    return `[${key}]="${translatedValue}"`;
   }
 
   // i18n
   if (value.startsWith('MochaI18n.')) {
     let expr = value.replace(/^MochaI18n\./, '');
-    expr = expr.replace(/controller\.(\w+)\.value/g, (_, n) => `${n}()`);
-    expr = expr.replace(/controller\.(\w+)\b/g, (_, n) => `${n}()`);
+    expr = translateControllerRef(expr);
     if (key === 'text' || key === 'title' || key === 'label') {
       return `[innerText]="i18n(${expr})"`;
     }
@@ -320,41 +425,58 @@ function mapBindingSimple(key: string, value: string, wasQuoted: boolean = false
   const get = value.match(/^(\w+)\.get\("(\w+)"\)$/);
   if (get) return `[${key}]="${get[1]}.${get[2]}"`;
 
-  // Theme reference
-  if (value.startsWith('Theme.')) return `[${key}]="${value}"`;
-
+  // Theme reference — translate QML Theme.colors.X to Catppuccin CSS variable
+  if (value.startsWith('Theme.')) {
+    const colorName = value.replace(/^Theme\.colors\./, '').replace(/^Theme\./, '');
+    // Map common Catppuccin color names to CSS custom property names
+    const cssVar = colorToCssVar(colorName);
+    return `[${key}]="${cssVar}"`;
+  }
   // Static values
   if (value === 'true') return key;
   if (value === 'false') return `[${key}]="false"`;
   if (/^-?\d+(\.\d+)?$/.test(value)) return `[${key}]="${value}"`;
 
   // Check if value contains quotes that would break HTML attribute syntax
-  const hasDoubleQ = fullyTranslated.includes('"');
-  const hasSingleQ = fullyTranslated.includes("'");
-  if (hasDoubleQ && !hasSingleQ) return `[${key}]='${fullyTranslated}'`;
-  if (hasDoubleQ && hasSingleQ) return `[${key}]="${fullyTranslated.replace(/"/g, '&quot;')}"`;
+  const hasDoubleQ = translatedValue.includes('"');
+  const hasSingleQ = translatedValue.includes("'");
+  if (hasDoubleQ && !hasSingleQ) return `[${key}]='${translatedValue}'`;
+  if (hasDoubleQ && hasSingleQ) return `[${key}]="${translatedValue.replace(/"/g, '&quot;')}"`;
 
   // Pass through as string attribute
   // SAFETY NET: if the original QML value was a quoted string literal, wrap
   // it in quotes so Angular parses it as a string instead of a JS identifier
   // (e.g. `text: "About"` → `[innerText]="'About'"`, not `[innerText]="About"`).
   if (wasQuoted) {
-    const escaped = fullyTranslated.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const escaped = translatedValue.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     return `[${key}]="'${escaped}'"`;
   }
-  return `[${key}]="${fullyTranslated}"`;
+  return `[${key}]="${translatedValue}"`;
 }
 
 // ── Old fallback formatter (for non-qml-ng elements) ──
 
-function formatAttrsFallback(props: [string, string, boolean][], _el: QmlElement): string {
-  if (props.length === 0) return '';
+function formatAttrsFallback(el: QmlElement, _unused: string, qpropertyNames: Set<string>): string {
   const parts: string[] = [];
-  for (const [key, value, wasQuoted] of props) {
-    if (shouldSkip(key)) continue;
-    if (key === 'id') continue;
-    if (key === 'text' && !value.startsWith('controller.') && !value.includes('(')) continue;
-    const binding = mapBindingFallback(key, value, wasQuoted);
+  for (const [rawKey, rawValue] of Object.entries(el.attrs)) {
+    if (shouldSkip(rawKey)) continue;
+    if (rawKey === 'id') continue;
+    if (rawKey === 'text' && !rawValue.startsWith('controller.') && !rawValue.includes('(')) continue;
+
+    let value = rawValue;
+    let wasQuoted = false;
+    const outerQuote = (value.startsWith('"') || value.startsWith("'")) ? value[0] : null;
+    if (outerQuote && value[value.length - 1] === outerQuote && value.length >= 2) {
+      const inner = value.slice(1, -1);
+      if (!inner.includes('"') && !inner.includes("'")) {
+        wasQuoted = true;
+        value = inner;
+      }
+    } else if (value.startsWith('{') && value.endsWith('}')) {
+      value = value.slice(1, -1).trim();
+    }
+
+    const binding = mapBindingFallback(rawKey, value, wasQuoted, qpropertyNames);
     if (binding) parts.push(binding);
   }
   return parts.length > 0 ? ' ' + parts.join(' ') : '';
@@ -376,28 +498,31 @@ function shouldSkip(key: string): boolean {
   ].includes(key);
 }
 
-function mapBindingFallback(key: string, value: string, wasQuoted: boolean = false): string | null {
-  // Translate controller.X.value → X() and controller.X → X()
-  const fullyTranslated = value
-    .replace(/controller\.(\w+)\.value/g, '$1()')
-    .replace(/controller\.(\w+)(?!\.)/g, '$1()');
+function mapBindingFallback(key: string, value: string, wasQuoted: boolean, qpropertyNames: Set<string>): string | null {
+  const fullyTranslated = translateControllerRef(value);
 
   if (key.startsWith('on') && /^on[A-Z]/.test(key)) {
     const event = mapEvent(key);
+    const chain = fullyTranslated.match(/^(\w+(?:\(\))?)\.(\w+)\(/);
+    if (chain) return `${event}="${chain[1]}.${chain[2]}($event)"`;
     const fn = fullyTranslated.match(/^(\w+)\(/);
-    if (fn) return `${event}="ctrl.${fn[1]}($event)"`;
-    const svc = value.match(/^(\w+)\.(\w+)\(/);
-    if (svc) return `${event}="ctrl.callRoot('${svc[1]}', '${svc[2]}')"`;
-    return `${event}="${fullyTranslated}"`;
+    if (fn) return `${event}="${fn[1]}($event)"`;
+    return `${event}='${fullyTranslated.replace(/'/g, "\\'")}'`;
   }
 
   if (value.startsWith('controller.')) {
     const m = value.match(/^controller\.(\w+)(?:\.value)?$/);
-    if (m) {
+    if (m && qpropertyNames.has(m[1])) {
       const prop = m[1];
       return key === 'text' || key === 'label' || key === 'title'
         ? `[innerText]="${prop}()"`
         : `[${key}]="${prop}()"`;
+    }
+    if (m) {
+      const prop = m[1];
+      return key === 'text' || key === 'label' || key === 'title'
+        ? `[innerText]="${prop}"`
+        : `[${key}]="${prop}"`;
     }
     return key === 'text' || key === 'label' || key === 'title'
       ? `[innerText]="${fullyTranslated}"`
@@ -406,8 +531,7 @@ function mapBindingFallback(key: string, value: string, wasQuoted: boolean = fal
 
   if (value.startsWith('MochaI18n.')) {
     let expr = value.replace(/^MochaI18n\./, '');
-    expr = expr.replace(/controller\.(\w+)\.value/g, (_, n) => `${n}()`);
-    expr = expr.replace(/controller\.(\w+)\b/g, (_, n) => `${n}()`);
+    expr = translateControllerRef(expr);
     return `[innerText]="i18n(${expr})"`;
   }
 
@@ -420,7 +544,19 @@ function mapBindingFallback(key: string, value: string, wasQuoted: boolean = fal
     return `${event}="ctrl.callRoot('${method[1]}', '${method[2]}')"`;
   }
 
-  if (value.startsWith('Theme.')) return `[${key}]="${value}"`;
+  if (key.startsWith('on') && /^on[A-Z]/.test(key)) {
+    const eventName = key.slice(2);
+    const lc = eventName.charAt(0).toLowerCase() + eventName.slice(1);
+    let body = value.replace(/^\{|\}$/g, '').trim();
+    if (body.startsWith('{')) body = body.slice(1).trim();
+    if (body.endsWith('}')) body = body.slice(0, -1).trim();
+    return `(${lc})='${body.replace(/'/g, "\\'")}'`;
+  }
+
+  if (value.startsWith('Theme.')) {
+    const colorName = value.replace(/^Theme\.colors\./, '').replace(/^Theme\./, '');
+    return `[${key}]="${colorToCssVar(colorName)}"`;
+  }
   if (value === 'true') return key;
   if (value === 'false') return `[${key}]="false"`;
   if (/^-?\d+(\.\d+)?$/.test(value)) return `[${key}]="${value}"`;
@@ -447,6 +583,30 @@ function mapEvent(signal: string): string {
     onTriggered: '(trigger)',
   };
   return m[signal] ?? `(${signal.slice(2).toLowerCase()})`;
+}
+
+function colorToCssVar(name: string): string {
+  // Catppuccin color names → CSS custom properties (used by qml-ng).
+  // Wrapped in quotes because JIT compiler treats attribute values
+  // as JS expressions and `var` is a reserved keyword.
+  const map: Record<string, string> = {
+    text: "var(--qml-text, var(--ctp-text, #cdd6f4))",
+    subtext0: "var(--qml-subtext0, var(--ctp-subtext0, #a6adc8))",
+    subtext1: "var(--qml-subtext1, var(--ctp-subtext1, #bac2de))",
+    background: "var(--qml-background, var(--ctp-base, #1e1e2e))",
+    surface: "var(--qml-surface, var(--ctp-mantle, #181825))",
+    mauve: "var(--qml-mauve, var(--ctp-mauve, #cba6f7))",
+    teal: "var(--qml-teal, var(--ctp-teal, #94e2d5))",
+    yellow: "var(--qml-yellow, var(--ctp-yellow, #f9e2af))",
+    green: "var(--qml-green, var(--ctp-green, #a6e3a1))",
+    red: "var(--qml-red, var(--ctp-red, #f38ba8))",
+    blue: "var(--qml-blue, var(--ctp-blue, #89b4fa))",
+    overlay0: "var(--qml-overlay0, var(--ctp-overlay0, #6c7086))",
+    overlay1: "var(--qml-overlay1, var(--ctp-overlay1, #7f849c))",
+    surface0: "var(--qml-surface0, var(--ctp-surface0, #313244))",
+    surface1: "var(--qml-surface1, var(--ctp-surface1, #45475a))",
+  };
+  return `'${map[name] ?? name}'`;
 }
 
 // ── Property parsing (unchanged from original) ──
@@ -491,6 +651,13 @@ function parseQmlProps(body: string): [string, string, boolean][] {
 
     if (depth > 0 && !afterColon) { i++; continue; }
     if (depth > 0 && afterColon) { value += ch; i++; continue; }
+
+    if (ch === ';' && afterColon && depth === 0) {
+      const v = value.trim();
+      if (v) pushProp(key, v, props);
+      key = ''; value = ''; afterColon = false;
+      i++; continue;
+    }
 
     if (ch === '\n') {
       if (key && afterColon) {
@@ -578,17 +745,35 @@ function buildComponent(
   const e = template.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\${/g, '\\${');
   const lines: string[] = [];
 
-  lines.push(`import { ${[...angularImports].join(', ')} } from '@angular/core';`);
+  // Transform the controller source into a pure Angular component class
+  const transform = transformControllerClass(options.controllerSource, options.controllerName);
+
+  // Build the set of Angular symbols we need to import
+  const angularSymbols = new Set<string>([...angularImports]);
+  if (transform) {
+    // Always need signal() for properties; computed() if any @qcomputed
+    angularSymbols.add('signal');
+    if (transform.computedNames.length > 0) angularSymbols.add('computed');
+    if (transform.viewChildNames.length > 0) {
+      angularSymbols.add('viewChild');
+      angularSymbols.add('ElementRef');
+    }
+    if (transform.inputNames.length > 0) angularSymbols.add('input');
+    if (transform.outputNames.length > 0) angularSymbols.add('output');
+    if (transform.additionalImports.includes('batch')) {
+      // Angular 20 does not export batch — we emit sequential set() calls instead
+    }
+    // Always add 'inject' if the transform detected injected services
+    if (transform.injectNames.length > 0) {
+      angularSymbols.add('inject');
+    }
+  }
+
+  lines.push(`import { ${[...angularSymbols].sort().join(', ')} } from '@angular/core';`);
 
   if (qmlNgImports.size > 0) {
     const names = [...qmlNgImports].sort();
-    lines.push(`import { ${names.join(', ')} } from '@mocha/qml-ng';`);
-  }
-
-  lines.push(`import { toQSignal } from '@mocha/compiler-web';`);
-  lines.push(`import { QObject, QProperty } from '@mocha/core';`);
-  if (options.qpropertyNames.length > 0) {
-    lines.push(`import { qproperty } from '@mocha/core';`);
+    lines.push(`import { ${names.join(', ')} } from '@mocha-framework/qml-ng';`);
   }
 
   // Emit a single `@angular/router` import containing RouterOutlet (when routes
@@ -600,14 +785,15 @@ function buildComponent(
     lines.push(`import { ${[...routerImportNames].sort().join(', ')} } from '@angular/router';`);
   }
 
-  const cleanControllerSource = stripTypeAnnotations(stripDecoLines(options.controllerSource));
+  // Emit imports for injected services (global-state, etc.)
+  if (transform && transform.injectClasses && transform.injectClasses.length > 0) {
+    for (const name of transform.injectClasses) {
+      const kebab = name.replace(/([A-Z])/g, '-$1').toLowerCase().replace(/^-/, '');
+      lines.push(`import { ${name} } from './${kebab}';`);
+    }
+  }
 
-  lines.push('');
-  lines.push(cleanControllerSource);
-  lines.push('');
-
-  // Build component imports array (qml-ng components + child components + RouterOutlet
-  // + Angular directives/pipes the template references, e.g. RouterLink).
+  // Build component imports array
   const componentImports = [...qmlNgImports].sort();
   for (const name of [...childImports].sort()) {
     if (!componentImports.includes(name)) componentImports.push(name);
@@ -626,16 +812,11 @@ function buildComponent(
   lines.push('  template: `' + e + '`,');
   lines.push('})');
   lines.push(`export class ${options.className} {`);
-  lines.push(`  ctrl = new ${options.controllerName}();`);
-  lines.push('');
 
-  for (const n of options.qpropertyNames) {
-    lines.push(`  ${n} = toQSignal(this.ctrl.${n});`);
-  }
-
-  lines.push('');
-  for (const n of options.methodNames) {
-    lines.push(`  ${n}(...args: any[]): any { return (this.ctrl as any)[${JSON.stringify(n)}](...args); }`);
+  if (transform) {
+    lines.push(...transform.bodyLines);
+  } else {
+    lines.push('  // (no controller source available)');
   }
 
   lines.push('}');
